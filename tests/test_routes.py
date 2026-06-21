@@ -851,6 +851,91 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(mock_post.call_args.args[0], "https://api.deepseek.com/chat/completions")
         self.assertEqual(mock_post.call_args.kwargs["json"]["model"], "deepseek-v4-pro")
 
+    @patch.dict(
+        os.environ,
+        {
+            "CHATMOCK_ENABLE_OLLAMA": "true",
+            "CHATMOCK_OLLAMA_BASE_URL": "http://localhost:11434/v1",
+            "CHATMOCK_OLLAMA_MODELS": "llama3.2",
+        },
+    )
+    @patch("chatmock.providers.requests.post")
+    def test_ollama_provider_routes_without_api_key(self, mock_post) -> None:
+        mock_post.return_value = FakeUpstream(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps({"id": "chatcmpl-local", "choices": [{"message": {"content": "ok"}}]}).encode("utf-8"),
+        )
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={"model": "ollama/llama3.2", "messages": [{"role": "user", "content": "ping"}]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_post.call_args.args[0], "http://localhost:11434/v1/chat/completions")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["model"], "llama3.2")
+        self.assertNotIn("Authorization", mock_post.call_args.kwargs["headers"])
+
+    @patch.dict(
+        os.environ,
+        {
+            "CHATMOCK_ENABLE_LM_STUDIO": "true",
+            "CHATMOCK_LM_STUDIO_BASE_URL": "http://localhost:1234/v1",
+            "CHATMOCK_LM_STUDIO_MODELS": "qwen3-coder",
+        },
+    )
+    @patch("chatmock.providers.requests.post")
+    def test_lm_studio_provider_routes_prefixed_models(self, mock_post) -> None:
+        mock_post.return_value = FakeUpstream(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps({"id": "chatcmpl-local", "choices": [{"message": {"content": "ok"}}]}).encode("utf-8"),
+        )
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={"model": "lm-studio/qwen3-coder", "messages": [{"role": "user", "content": "ping"}]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_post.call_args.args[0], "http://localhost:1234/v1/chat/completions")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["model"], "qwen3-coder")
+
+    @patch.dict(
+        os.environ,
+        {
+            "CUSTOM_PROVIDER_KEY": "custom-key",
+            "CHATMOCK_PROVIDERS_JSON": json.dumps(
+                [
+                    {
+                        "name": "custom",
+                        "base_url": "https://custom.example/v1",
+                        "api_key_env": "CUSTOM_PROVIDER_KEY",
+                        "models": ["custom-coder"],
+                    }
+                ]
+            ),
+        },
+    )
+    @patch("chatmock.providers.requests.post")
+    def test_custom_provider_json_routes_models(self, mock_post) -> None:
+        mock_post.return_value = FakeUpstream(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps({"id": "chatcmpl-custom", "choices": [{"message": {"content": "ok"}}]}).encode("utf-8"),
+        )
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={"model": "custom-coder", "messages": [{"role": "user", "content": "ping"}]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_post.call_args.args[0], "https://custom.example/v1/chat/completions")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["model"], "custom-coder")
+        self.assertEqual(mock_post.call_args.kwargs["headers"]["Authorization"], "Bearer custom-key")
+
     @patch("chatmock.websocket_routes.get_effective_chatgpt_auth", return_value=("token", "acct"))
     @patch("chatmock.websocket_routes.connect_upstream_websocket")
     def test_responses_websocket_rewrites_response_create(self, mock_connect, _mock_auth) -> None:
