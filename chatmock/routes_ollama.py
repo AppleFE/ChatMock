@@ -12,6 +12,7 @@ from .fast_mode import resolve_service_tier
 from .limits import record_rate_limits_from_response
 from .http import build_cors_headers
 from .model_registry import list_public_models, uses_codex_instructions
+from .providers import iter_provider_models
 from .responses_api import instructions_for_model
 from .reasoning import (
     allowed_efforts_for_model,
@@ -92,6 +93,7 @@ def ollama_tags() -> Response:
         print("IN GET /api/tags")
     expose_variants = bool(current_app.config.get("EXPOSE_REASONING_MODELS"))
     model_ids = list_public_models(expose_reasoning_models=expose_variants)
+    model_ids.extend(model_id for model_id, _provider_name in iter_provider_models())
     models = []
     for model_id in model_ids:
         models.append(

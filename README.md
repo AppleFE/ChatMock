@@ -88,9 +88,15 @@ The server runs at `http://127.0.0.1:8000` by default. Use `http://127.0.0.1:800
 ## Supported Models
 
 - `gpt-5.5`
+- `gpt-5.5-pro`
+- `gpt-5.5-instant`
+- `gpt-5.6` (preconfigured for rollout)
 - `gpt-5.4`
+- `gpt-5.4-pro`
 - `gpt-5.4-mini`
+- `gpt-5.4-nano`
 - `gpt-5.3-codex-spark`
+- External provider models when enabled: Z.AI GLM, Xiaomi MiMo, DeepSeek, Ollama, LM Studio, and custom OpenAI-compatible providers
 
 <br>
 
@@ -103,6 +109,7 @@ The server runs at `http://127.0.0.1:8000` by default. Use `http://127.0.0.1:800
 - Configurable thinking effort
 - Fast mode for supported models
 - Web search tool
+- External provider routing via `.env`
 - OpenAI-compatible `/v1/responses` (HTTP + WebSocket)
 - Ollama-compatible endpoints
 - Reasoning effort exposed as separate models (optional)
@@ -121,6 +128,34 @@ All flags go after `chatmock serve`. These can also be set as environment variab
 | `--fast-mode` | `CHATGPT_LOCAL_FAST_MODE` | true/false | false | Priority processing for supported models |
 | `--enable-web-search` | `CHATGPT_LOCAL_ENABLE_WEB_SEARCH` | true/false | false | Allow the model to search the web |
 | `--expose-reasoning-models` | `CHATGPT_LOCAL_EXPOSE_REASONING_MODELS` | true/false | false | List each reasoning level as its own model |
+
+### Provider routing
+
+ChatMock routes ChatGPT/Codex model IDs through your ChatGPT login. When an enabled provider model is requested, ChatMock proxies it to that provider's OpenAI-compatible endpoint instead.
+
+| Provider | Enable with | Default base URL | Default models |
+|----------|-------------|------------------|----------------|
+| Z.AI GLM Coding Plan | `CHATMOCK_ZAI_API_KEY` | `https://api.z.ai/api/coding/paas/v4` | `glm-5.2`, `glm-5.1`, `glm-5`, `glm-5-turbo`, `glm-4.7`, `glm-4.5-air` |
+| Xiaomi MiMo Token Plan | `CHATMOCK_XIAOMI_API_KEY` | `https://token-plan-sgp.xiaomimimo.com/v1` | `mimo-v2.5-pro`, `mimo-v2.5` |
+| DeepSeek API | `CHATMOCK_DEEPSEEK_API_KEY` | `https://api.deepseek.com` | `deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-chat`, `deepseek-reasoner` |
+| Ollama | `CHATMOCK_ENABLE_OLLAMA=true` | `http://localhost:11434/v1` | set `CHATMOCK_OLLAMA_MODELS` |
+| LM Studio | `CHATMOCK_ENABLE_LM_STUDIO=true` | `http://localhost:1234/v1` | set `CHATMOCK_LM_STUDIO_MODELS` |
+
+You can also add providers with `CHATMOCK_PROVIDERS_JSON`:
+
+```json
+[
+  {
+    "name": "my",
+    "base_url": "https://example.com/v1",
+    "api_key_env": "MY_API_KEY",
+    "models": ["my-model"]
+  }
+]
+```
+
+Provider models work with `/v1/chat/completions`; `/v1/responses` is passed through when the provider supports it, otherwise ChatMock wraps a chat completion as a Responses object.
+For Z.AI, use `glm-5.2` on the OpenAI-compatible endpoint; the `glm-5.2[1m]` suffix is for Anthropic-compatible Claude Code configuration and is not accepted by the OpenAI-compatible coding endpoint.
 
 <details>
 <summary><b>Web search in a request</b></summary>

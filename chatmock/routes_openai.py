@@ -11,6 +11,12 @@ from .fast_mode import resolve_service_tier
 from .limits import record_rate_limits_from_response
 from .http import build_cors_headers
 from .model_registry import list_public_models, uses_codex_instructions
+from .providers import (
+    find_provider_route,
+    iter_provider_models,
+    proxy_provider_endpoint,
+    proxy_provider_responses,
+)
 from .responses_api import (
     ResponsesRequestError,
     aggregate_response_from_sse,
@@ -503,6 +509,14 @@ def chat_completions() -> Response:
             return jsonify(err), 400
 
     requested_model = payload.get("model")
+    provider_route = find_provider_route(requested_model)
+    if provider_route is not None:
+        return proxy_provider_endpoint(
+            provider_route,
+            provider_route.provider.chat_completions_path,
+            payload,
+        )
+
     model = normalize_model_name(requested_model, current_app.config.get("DEBUG_MODEL"))
     messages = payload.get("messages")
     if messages is None and isinstance(payload.get("prompt"), str):
@@ -805,6 +819,14 @@ def completions() -> Response:
         return jsonify(err), 400
 
     requested_model = payload.get("model")
+    provider_route = find_provider_route(requested_model)
+    if provider_route is not None:
+        return proxy_provider_endpoint(
+            provider_route,
+            provider_route.provider.completions_path,
+            payload,
+        )
+
     model = normalize_model_name(requested_model, current_app.config.get("DEBUG_MODEL"))
     prompt = payload.get("prompt")
     if isinstance(prompt, list):
@@ -1005,6 +1027,10 @@ def responses_create() -> Response:
             _log_json("OUT POST /v1/responses", err)
         return jsonify(err), 400
 
+    provider_route = find_provider_route(payload.get("model"))
+    if provider_route is not None:
+        return proxy_provider_responses(provider_route, payload)
+
     payload = _normalize_responses_image_tools_in_payload(payload)
 
     try:
@@ -1143,6 +1169,10 @@ def list_models() -> Response:
     expose_variants = bool(current_app.config.get("EXPOSE_REASONING_MODELS"))
     model_ids = list_public_models(expose_reasoning_models=expose_variants)
     data = [{"id": mid, "object": "model", "owned_by": "owner"} for mid in model_ids]
+    data.extend(
+        {"id": model_id, "object": "model", "owned_by": provider_name}
+        for model_id, provider_name in iter_provider_models()
+    )
     models = {"object": "list", "data": data}
     resp = make_response(jsonify(models), 200)
     for k, v in build_cors_headers().items():

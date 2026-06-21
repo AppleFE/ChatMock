@@ -15,6 +15,8 @@ class FastModeTests(unittest.TestCase):
 
     def test_priority_allowlist_uses_normalized_model_ids(self) -> None:
         self.assertTrue(supports_priority_service_tier("gpt5.4"))
+        self.assertTrue(supports_priority_service_tier("gpt5.5"))
+        self.assertTrue(supports_priority_service_tier("gpt5.6"))
         self.assertFalse(supports_priority_service_tier("gpt-5.3-codex"))
 
     def test_explicit_fast_mode_true_errors_for_unsupported_model(self) -> None:

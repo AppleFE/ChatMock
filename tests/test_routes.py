@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import time
@@ -700,6 +701,155 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(outbound_payload["tools"][0]["quality"], "medium")
         self.assertEqual(outbound_payload["tools"][0]["size"], "3840x2160")
         self.assertEqual(outbound_payload["tools"][0]["partial_images"], 3)
+
+    @patch.dict(
+        os.environ,
+        {
+            "CHATMOCK_ENABLE_ZAI": "true",
+            "CHATMOCK_ENABLE_XIAOMI": "true",
+            "CHATMOCK_ENABLE_DEEPSEEK": "true",
+            "CHATMOCK_ENABLE_OLLAMA": "true",
+            "CHATMOCK_OLLAMA_MODELS": "llama3.2",
+        },
+    )
+    def test_models_list_includes_enabled_provider_models(self) -> None:
+        response = self.client.get("/v1/models")
+        body = response.get_json()
+        model_ids = [item["id"] for item in body["data"]]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("glm-5.2", model_ids)
+        self.assertIn("glm-5.1", model_ids)
+        self.assertIn("mimo-v2.5-pro", model_ids)
+        self.assertIn("deepseek-v4-flash", model_ids)
+        self.assertIn("llama3.2", model_ids)
+
+    @patch.dict(
+        os.environ,
+        {
+            "CHATMOCK_ZAI_API_KEY": "test-key",
+            "CHATMOCK_ZAI_BASE_URL": "https://api.z.ai/api/coding/paas/v4",
+        },
+    )
+    @patch("chatmock.providers.requests.post")
+    def test_chat_completions_routes_provider_models(self, mock_post) -> None:
+        mock_post.return_value = FakeUpstream(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps(
+                {
+                    "id": "chatcmpl-zai",
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "pong"}}],
+                }
+            ).encode("utf-8"),
+        )
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={"model": "glm-5.2", "messages": [{"role": "user", "content": "ping"}]},
+        )
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["id"], "chatcmpl-zai")
+        self.assertEqual(body["choices"][0]["message"]["content"], "pong")
+        self.assertEqual(mock_post.call_args.args[0], "https://api.z.ai/api/coding/paas/v4/chat/completions")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["model"], "glm-5.2")
+        self.assertEqual(mock_post.call_args.kwargs["headers"]["Authorization"], "Bearer test-key")
+
+    @patch.dict(
+        os.environ,
+        {
+            "CHATMOCK_XIAOMI_API_KEY": "test-key",
+            "CHATMOCK_XIAOMI_BASE_URL": "https://token-plan-sgp.xiaomimimo.com/v1",
+        },
+    )
+    @patch("chatmock.providers.requests.post")
+    def test_responses_route_wraps_provider_chat_completion(self, mock_post) -> None:
+        mock_post.return_value = FakeUpstream(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps(
+                {
+                    "id": "chatcmpl-mimo",
+                    "created": 123,
+                    "choices": [{"message": {"role": "assistant", "content": "mimo pong"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+                }
+            ).encode("utf-8"),
+        )
+
+        response = self.client.post(
+            "/v1/responses",
+            json={
+                "model": "mimo-v2.5-pro",
+                "instructions": "Be terse",
+                "input": "ping",
+                "enable_thinking": False,
+            },
+        )
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["id"], "chatcmpl-mimo")
+        self.assertEqual(body["status"], "completed")
+        self.assertEqual(body["model"], "mimo-v2.5-pro")
+        self.assertEqual(body["output"][0]["content"][0]["text"], "mimo pong")
+        self.assertEqual(body["usage"]["total_tokens"], 3)
+        outbound = mock_post.call_args.kwargs["json"]
+        self.assertEqual(mock_post.call_args.args[0], "https://token-plan-sgp.xiaomimimo.com/v1/chat/completions")
+        self.assertEqual(outbound["model"], "mimo-v2.5-pro")
+        self.assertIs(outbound["enable_thinking"], False)
+        self.assertEqual(outbound["messages"][0], {"role": "system", "content": "Be terse"})
+        self.assertEqual(outbound["messages"][1], {"role": "user", "content": "ping"})
+
+    @patch.dict(
+        os.environ,
+        {
+            "CHATMOCK_XIAOMI_API_KEY": "(https://token-plan-sgp.xiaomimimo.com/anthropic)tp-test",
+        },
+    )
+    @patch("chatmock.providers.requests.post")
+    def test_provider_key_can_embed_xiaomi_base_url(self, mock_post) -> None:
+        mock_post.return_value = FakeUpstream(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps({"id": "chatcmpl-mimo", "choices": [{"message": {"content": "ok"}}]}).encode("utf-8"),
+        )
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={"model": "mimo-v2.5-pro", "messages": [{"role": "user", "content": "ping"}]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_post.call_args.args[0], "https://token-plan-sgp.xiaomimimo.com/v1/chat/completions")
+        self.assertEqual(mock_post.call_args.kwargs["headers"]["Authorization"], "Bearer tp-test")
+
+    @patch.dict(
+        os.environ,
+        {
+            "CHATMOCK_DEEPSEEK_API_KEY": "test-key",
+            "CHATMOCK_DEEPSEEK_BASE_URL": "https://api.deepseek.com",
+        },
+    )
+    @patch("chatmock.providers.requests.post")
+    def test_provider_prefix_alias_routes_to_upstream_model(self, mock_post) -> None:
+        mock_post.return_value = FakeUpstream(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps({"id": "chatcmpl-ds", "choices": [{"message": {"content": "ok"}}]}).encode("utf-8"),
+        )
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek/deepseek-v4-pro", "messages": [{"role": "user", "content": "ping"}]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_post.call_args.args[0], "https://api.deepseek.com/chat/completions")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["model"], "deepseek-v4-pro")
 
     @patch("chatmock.websocket_routes.get_effective_chatgpt_auth", return_value=("token", "acct"))
     @patch("chatmock.websocket_routes.connect_upstream_websocket")
