@@ -8,6 +8,10 @@ from chatmock.model_registry import allowed_efforts_for_model, list_public_model
 class ModelRegistryTests(unittest.TestCase):
     def test_normalizes_aliases(self) -> None:
         self.assertEqual(normalize_model_name("gpt5"), "gpt-5")
+        self.assertEqual(normalize_model_name("gpt5-pro"), "gpt-5-pro")
+        self.assertEqual(normalize_model_name("gpt5-mini"), "gpt-5-mini")
+        self.assertEqual(normalize_model_name("gpt5-nano"), "gpt-5-nano")
+        self.assertEqual(normalize_model_name("gpt5.2-pro"), "gpt-5.2-pro")
         self.assertEqual(normalize_model_name("gpt5.4"), "gpt-5.4")
         self.assertEqual(normalize_model_name("gpt5.4-mini"), "gpt-5.4-mini")
         self.assertEqual(normalize_model_name("gpt5.5"), "gpt-5.5")
@@ -42,6 +46,10 @@ class ModelRegistryTests(unittest.TestCase):
         self.assertIn("gpt-5.4-pro", model_ids)
         self.assertIn("gpt-5.4-mini", model_ids)
         self.assertIn("gpt-5.4-nano", model_ids)
+        self.assertIn("gpt-5.2-pro", model_ids)
+        self.assertIn("gpt-5-pro", model_ids)
+        self.assertIn("gpt-5-mini", model_ids)
+        self.assertIn("gpt-5-nano", model_ids)
         self.assertIn("gpt-5.3-codex-spark", model_ids)
         self.assertIn("gpt-5.5-none", model_ids)
         self.assertIn("gpt-5.6-none", model_ids)

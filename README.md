@@ -95,6 +95,10 @@ The server runs at `http://127.0.0.1:8000` by default. Use `http://127.0.0.1:800
 - `gpt-5.4-pro`
 - `gpt-5.4-mini`
 - `gpt-5.4-nano`
+- `gpt-5.2-pro`
+- `gpt-5-pro`
+- `gpt-5-mini`
+- `gpt-5-nano`
 - `gpt-5.3-codex-spark`
 - External provider models when enabled: Z.AI GLM, Xiaomi MiMo, DeepSeek, Ollama, LM Studio, and custom OpenAI-compatible providers
 
