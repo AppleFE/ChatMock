@@ -98,6 +98,7 @@ The server runs at `http://127.0.0.1:8000` by default. Use `http://127.0.0.1:800
 
 - Tool / function calling
 - Vision / image input
+- OpenAI-compatible `/v1/images/generations` with `b64_json` output
 - Thinking summaries (via think tags)
 - Configurable thinking effort
 - Fast mode for supported models
@@ -132,6 +133,22 @@ All flags go after `chatmock serve`. These can also be set as environment variab
   "responses_tool_choice": "auto"
 }
 ```
+
+</details>
+
+<details>
+<summary><b>Image generation</b></summary>
+
+```json
+{
+  "prompt": "a clean product render of a translucent keyboard on a dark desk",
+  "model": "gpt-image-1.5",
+  "quality": "high",
+  "size": "2k"
+}
+```
+
+POST this to `/v1/images/generations`. The response returns `data[0].b64_json`.
 
 </details>
 

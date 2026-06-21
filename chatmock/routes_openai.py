@@ -27,6 +27,7 @@ from .reasoning import (
 )
 from .session import (
     clear_responses_reuse_state,
+    ensure_session_id,
     note_responses_final_response,
     note_responses_stream_event,
     prepare_responses_request_for_session,
@@ -41,6 +42,37 @@ from .utils import (
 
 
 openai_bp = Blueprint("openai", __name__)
+
+RESPONSES_PASSTHROUGH_INSTRUCTIONS = "You are a helpful, precise assistant."
+RESPONSES_IMAGE_FALLBACK_MODEL = "gpt-5.4"
+RESPONSES_IMAGE_TOOL_DEFAULT_MODEL = "gpt-image-1.5"
+
+IMAGE_QUALITY_ALIASES = {
+    "auto": "auto",
+    "low": "low",
+    "medium": "medium",
+    "med": "medium",
+    "high": "high",
+}
+
+IMAGE_SIZE_ALIASES = {
+    "1024x1024": "1024x1024",
+    "1024x1536": "1024x1536",
+    "1536x1024": "1536x1024",
+    "square": "1024x1024",
+    "portrait": "1024x1536",
+    "landscape": "1536x1024",
+    "2k": "2048x1152",
+    "2k-landscape": "2048x1152",
+    "2k_landscape": "2048x1152",
+    "2k-portrait": "1152x2048",
+    "2k_portrait": "1152x2048",
+    "4k": "3840x2160",
+    "4k-landscape": "3840x2160",
+    "4k_landscape": "3840x2160",
+    "4k-portrait": "2160x3840",
+    "4k_portrait": "2160x3840",
+}
 
 
 def _log_json(prefix: str, payload: Any) -> None:
@@ -75,6 +107,349 @@ def _wrap_stream_logging(label: str, iterator, enabled: bool):
 
 def _instructions_for_model(model: str) -> str:
     return instructions_for_model(current_app.config, model)
+
+
+def _make_json_response(body: Any, status: int, extra_headers: Dict[str, str] | None = None) -> Response:
+    resp = make_response(jsonify(body), status)
+    for k, v in build_cors_headers().items():
+        resp.headers.setdefault(k, v)
+    if isinstance(extra_headers, dict):
+        for k, v in extra_headers.items():
+            if isinstance(k, str) and isinstance(v, str) and v:
+                resp.headers.setdefault(k, v)
+    return resp
+
+
+def _as_nonempty_str(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _normalize_image_quality(value: Any) -> tuple[str | None, str | None]:
+    raw = _as_nonempty_str(value)
+    if raw is None:
+        return None, None
+    resolved = IMAGE_QUALITY_ALIASES.get(raw.lower())
+    return resolved, raw
+
+
+def _normalize_image_size(value: Any) -> tuple[str | None, str | None]:
+    raw = _as_nonempty_str(value)
+    if raw is None:
+        return None, None
+    lowered = raw.lower()
+    resolved = IMAGE_SIZE_ALIASES.get(lowered, raw)
+    note = f"{raw}->{resolved}" if resolved != raw else None
+    return resolved, note
+
+
+def _normalize_partial_images(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return 3
+    return max(1, min(3, parsed))
+
+
+def _looks_like_raw_base64(value: str) -> bool:
+    if value.startswith("data:") or value.startswith("http://") or value.startswith("https://"):
+        return False
+    compact = "".join(value.split())
+    if len(compact) < 24:
+        return False
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+    return all(ch in allowed for ch in compact)
+
+
+def _normalize_image_url(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in ("image_url", "url", "data_url", "b64_json", "b64"):
+            candidate = value.get(key)
+            if isinstance(candidate, dict):
+                candidate = candidate.get("url")
+            url = _normalize_image_url(candidate)
+            if url:
+                return url
+        return None
+
+    raw = _as_nonempty_str(value)
+    if raw is None:
+        return None
+    if raw.startswith("data:") or raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+    if _looks_like_raw_base64(raw):
+        return "data:image/png;base64," + "".join(raw.split())
+    return raw
+
+
+def _collect_image_inputs(payload: Dict[str, Any]) -> List[Dict[str, str]]:
+    values: List[Any] = []
+    for key in ("image", "images", "input_images"):
+        raw = payload.get(key)
+        if isinstance(raw, list):
+            values.extend(raw)
+        elif raw is not None:
+            values.append(raw)
+
+    out: List[Dict[str, str]] = []
+    for value in values:
+        url = _normalize_image_url(value)
+        if url:
+            out.append({"type": "input_image", "image_url": url})
+    return out
+
+
+def _normalize_image_generation_tool(tool: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, str]]:
+    normalized = dict(tool)
+    metadata: Dict[str, str] = {}
+
+    quality, requested_quality = _normalize_image_quality(normalized.get("quality"))
+    if quality:
+        normalized["quality"] = quality
+        if requested_quality:
+            metadata["quality_requested"] = requested_quality
+            metadata["quality_resolved"] = quality
+
+    size, size_note = _normalize_image_size(normalized.get("size"))
+    if size:
+        normalized["size"] = size
+        metadata["size"] = size
+        if size_note:
+            metadata["size_alias_note"] = size_note
+
+    if "partial_images" in normalized:
+        normalized["partial_images"] = _normalize_partial_images(normalized.get("partial_images"))
+
+    return normalized, metadata
+
+
+def _normalize_responses_image_tools_in_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return payload
+
+    normalized_tools: List[Any] = []
+    changed = False
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("type") == "image_generation":
+            normalized, _metadata = _normalize_image_generation_tool(tool)
+            normalized_tools.append(normalized)
+            changed = changed or normalized != tool
+        else:
+            normalized_tools.append(tool)
+
+    if not changed:
+        return payload
+    updated = dict(payload)
+    updated["tools"] = normalized_tools
+    return updated
+
+
+def _extract_image_b64(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        raw = value.strip()
+        if raw.startswith("data:") and "," in raw:
+            return raw.split(",", 1)[1]
+        return raw
+    if isinstance(value, dict):
+        for key in ("b64_json", "result", "partial_image", "image_b64", "image", "data"):
+            found = _extract_image_b64(value.get(key))
+            if found:
+                return found
+        output = value.get("output")
+        if isinstance(output, list):
+            found = _extract_image_b64(output)
+            if found:
+                return found
+    if isinstance(value, list):
+        for item in value:
+            found = _extract_image_b64(item)
+            if found:
+                return found
+    return None
+
+
+def _extract_revised_prompt(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in ("revised_prompt", "revisedPrompt"):
+            prompt = _as_nonempty_str(value.get(key))
+            if prompt:
+                return prompt
+        for key in ("item", "response", "output", "data"):
+            found = _extract_revised_prompt(value.get(key))
+            if found:
+                return found
+    if isinstance(value, list):
+        for item in value:
+            found = _extract_revised_prompt(item)
+            if found:
+                return found
+    return None
+
+
+def _build_image_tool_from_payload(payload: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, str]]:
+    tool: Dict[str, Any] = {
+        "type": "image_generation",
+        "model": _as_nonempty_str(payload.get("model")) or RESPONSES_IMAGE_TOOL_DEFAULT_MODEL,
+        "partial_images": _normalize_partial_images(payload.get("partial_images")),
+    }
+
+    for key in ("background", "moderation", "output_compression", "output_format"):
+        value = payload.get(key)
+        if isinstance(value, (str, int, float, bool)) and str(value).strip():
+            tool[key] = value
+
+    n = payload.get("n")
+    if isinstance(n, int) and n > 0:
+        tool["n"] = n
+
+    for key in ("quality", "size"):
+        if key in payload:
+            tool[key] = payload.get(key)
+
+    return _normalize_image_generation_tool(tool)
+
+
+def _image_generations_via_chatgpt_auth(payload: Dict[str, Any], *, verbose: bool = False) -> Response:
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return _make_json_response({"error": {"message": "Request must include prompt: string"}}, 400)
+
+    requested_responses_model = _as_nonempty_str(payload.get("responses_model")) or RESPONSES_IMAGE_FALLBACK_MODEL
+    responses_model = normalize_model_name(requested_responses_model, current_app.config.get("DEBUG_MODEL"))
+    image_tool, metadata = _build_image_tool_from_payload(payload)
+
+    content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt.strip()}]
+    content.extend(_collect_image_inputs(payload))
+    input_items = [{"type": "message", "role": "user", "content": content}]
+
+    session_id = ensure_session_id(
+        RESPONSES_PASSTHROUGH_INSTRUCTIONS,
+        input_items,
+        extract_client_session_id(request.headers),
+    )
+    upstream_payload = {
+        "model": responses_model,
+        "instructions": RESPONSES_PASSTHROUGH_INSTRUCTIONS,
+        "input": input_items,
+        "tools": [image_tool],
+        "tool_choice": {"type": "image_generation"},
+        "parallel_tool_calls": False,
+        "store": False,
+        "stream": True,
+        "prompt_cache_key": session_id,
+    }
+
+    if verbose:
+        _log_json("OUTBOUND >> /v1/images/generations Responses payload", upstream_payload)
+
+    upstream, error_resp = start_upstream_raw_request(
+        upstream_payload,
+        session_id=session_id,
+        stream=True,
+    )
+    if error_resp is not None:
+        return error_resp
+
+    record_rate_limits_from_response(upstream)
+
+    headers: Dict[str, str] = {
+        "x-chatmock-image-source": "chatgpt-responses",
+        "x-chatmock-upstream-model": str(image_tool.get("model") or ""),
+        "x-chatmock-quality-honored": "unknown",
+    }
+    if isinstance(metadata.get("size"), str):
+        headers["x-chatmock-upstream-size"] = metadata["size"]
+    if isinstance(metadata.get("quality_requested"), str):
+        headers["x-chatmock-upstream-quality-requested"] = metadata["quality_requested"]
+    if isinstance(metadata.get("quality_resolved"), str):
+        headers["x-chatmock-upstream-quality-resolved"] = metadata["quality_resolved"]
+    if isinstance(metadata.get("size_alias_note"), str):
+        headers["x-chatmock-size-alias-note"] = metadata["size_alias_note"]
+
+    if upstream.status_code >= 400:
+        try:
+            err_body = (
+                json.loads(upstream.content.decode("utf-8", errors="ignore"))
+                if upstream.content
+                else {"error": {"message": upstream.text}}
+            )
+        except Exception:
+            err_body = {"error": {"message": upstream.text or "Upstream error"}}
+        finally:
+            upstream.close()
+        return _make_json_response(err_body, upstream.status_code, headers)
+
+    final_image_b64: str | None = None
+    completed_image_b64: str | None = None
+    partial_image_b64: str | None = None
+    revised_prompt: str | None = None
+    error_message: str | None = None
+
+    try:
+        for raw_line in upstream.iter_lines(decode_unicode=False):
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, (bytes, bytearray)) else raw_line
+            if not line.startswith("data: "):
+                continue
+            data = line[len("data: ") :].strip()
+            if not data:
+                continue
+            if data == "[DONE]":
+                break
+            try:
+                event = json.loads(data)
+            except Exception:
+                continue
+            if not isinstance(event, dict):
+                continue
+
+            kind = event.get("type")
+            revised_prompt = _extract_revised_prompt(event) or revised_prompt
+            if kind == "response.image_generation_call.partial_image":
+                partial_image_b64 = _extract_image_b64(event) or partial_image_b64
+            elif kind == "response.output_item.done":
+                item = event.get("item")
+                if isinstance(item, dict) and item.get("type") == "image_generation_call":
+                    final_image_b64 = _extract_image_b64(item) or final_image_b64
+                    revised_prompt = _extract_revised_prompt(item) or revised_prompt
+            elif kind == "response.failed":
+                response = event.get("response")
+                if isinstance(response, dict) and isinstance(response.get("error"), dict):
+                    error_message = response["error"].get("message") or "response.failed"
+                else:
+                    error_message = "response.failed"
+                break
+            elif kind == "response.completed":
+                response = event.get("response")
+                completed_image_b64 = _extract_image_b64(response) or completed_image_b64
+                revised_prompt = _extract_revised_prompt(response) or revised_prompt
+                break
+    finally:
+        upstream.close()
+
+    if error_message:
+        return _make_json_response({"error": {"message": error_message}}, 502, headers)
+
+    image_b64 = final_image_b64 or completed_image_b64 or partial_image_b64
+    if not image_b64:
+        return _make_json_response(
+            {"error": {"message": "Upstream image generation did not produce image data"}},
+            502,
+            headers,
+        )
+
+    headers["x-chatmock-image-stage"] = (
+        "partial"
+        if image_b64 == partial_image_b64 and not (final_image_b64 or completed_image_b64)
+        else "final"
+    )
+    item: Dict[str, Any] = {"b64_json": image_b64}
+    if revised_prompt:
+        item["revised_prompt"] = revised_prompt
+    return _make_json_response({"created": int(time.time()), "data": [item]}, 200, headers)
 
 
 def _service_tier_from_payload(
@@ -571,6 +946,41 @@ def completions() -> Response:
     return resp
 
 
+@openai_bp.route("/v1/images/generations", methods=["POST"])
+def image_generations() -> Response:
+    verbose = bool(current_app.config.get("VERBOSE"))
+
+    raw = request.get_data(cache=True, as_text=True) or ""
+    if verbose:
+        try:
+            print("IN POST /v1/images/generations\n" + raw)
+        except Exception:
+            pass
+
+    try:
+        payload = json.loads(raw) if raw else {}
+    except Exception:
+        err = {"error": {"message": "Invalid JSON body"}}
+        if verbose:
+            _log_json("OUT POST /v1/images/generations", err)
+        return _make_json_response(err, 400)
+
+    if not isinstance(payload, dict):
+        err = {"error": {"message": "Request body must be a JSON object"}}
+        if verbose:
+            _log_json("OUT POST /v1/images/generations", err)
+        return _make_json_response(err, 400)
+
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        err = {"error": {"message": "Request must include prompt: string"}}
+        if verbose:
+            _log_json("OUT POST /v1/images/generations", err)
+        return _make_json_response(err, 400)
+
+    return _image_generations_via_chatgpt_auth(payload, verbose=verbose)
+
+
 @openai_bp.route("/v1/responses", methods=["POST"])
 def responses_create() -> Response:
     verbose = bool(current_app.config.get("VERBOSE"))
@@ -594,6 +1004,8 @@ def responses_create() -> Response:
         if verbose:
             _log_json("OUT POST /v1/responses", err)
         return jsonify(err), 400
+
+    payload = _normalize_responses_image_tools_in_payload(payload)
 
     try:
         normalized = normalize_responses_payload(

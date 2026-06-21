@@ -556,6 +556,151 @@ class RouteTests(unittest.TestCase):
         self.assertIn("Fast mode is not supported", body["error"]["message"])
         mock_start.assert_not_called()
 
+    def test_image_generations_rejects_invalid_json(self) -> None:
+        response = self.client.post(
+            "/v1/images/generations",
+            data="{",
+            content_type="application/json",
+        )
+        body = response.get_json()
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(body["error"]["message"], "Invalid JSON body")
+
+    def test_image_generations_rejects_non_object_body(self) -> None:
+        response = self.client.post(
+            "/v1/images/generations",
+            data="[]",
+            content_type="application/json",
+        )
+        body = response.get_json()
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(body["error"]["message"], "Request body must be a JSON object")
+
+    def test_image_generations_requires_prompt(self) -> None:
+        response = self.client.post("/v1/images/generations", json={})
+        body = response.get_json()
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(body["error"]["message"], "Request must include prompt: string")
+
+    @patch("chatmock.routes_openai.start_upstream_raw_request")
+    def test_image_generations_returns_output_item_done_image(self, mock_start) -> None:
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.created", "response": {"id": "resp_image"}},
+                    {
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "image_generation_call",
+                            "result": "FINAL_IMAGE_B64",
+                            "revised_prompt": "a polished icon",
+                        },
+                    },
+                    {"type": "response.completed", "response": {"id": "resp_image", "output": []}},
+                ],
+                headers={"Content-Type": "text/event-stream"},
+            ),
+            None,
+        )
+
+        response = self.client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "make an app icon",
+                "model": "gpt-image-1.5",
+                "responses_model": "gpt5.4-mini",
+                "quality": "med",
+                "size": "2k",
+                "partial_images": 99,
+                "image": {"url": "data:image/png;base64,INPUT_IMAGE_B64"},
+            },
+        )
+
+        body = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["data"][0]["b64_json"], "FINAL_IMAGE_B64")
+        self.assertEqual(body["data"][0]["revised_prompt"], "a polished icon")
+        self.assertEqual(response.headers["x-chatmock-image-stage"], "final")
+        self.assertEqual(response.headers["x-chatmock-upstream-size"], "2048x1152")
+        self.assertEqual(response.headers["x-chatmock-size-alias-note"], "2k->2048x1152")
+        self.assertEqual(response.headers["x-chatmock-upstream-quality-requested"], "med")
+        self.assertEqual(response.headers["x-chatmock-upstream-quality-resolved"], "medium")
+
+        outbound_payload = mock_start.call_args.args[0]
+        self.assertEqual(outbound_payload["model"], "gpt-5.4-mini")
+        self.assertEqual(outbound_payload["tool_choice"], {"type": "image_generation"})
+        self.assertEqual(outbound_payload["tools"][0]["model"], "gpt-image-1.5")
+        self.assertEqual(outbound_payload["tools"][0]["quality"], "medium")
+        self.assertEqual(outbound_payload["tools"][0]["size"], "2048x1152")
+        self.assertEqual(outbound_payload["tools"][0]["partial_images"], 3)
+        self.assertEqual(
+            outbound_payload["input"][0]["content"],
+            [
+                {"type": "input_text", "text": "make an app icon"},
+                {"type": "input_image", "image_url": "data:image/png;base64,INPUT_IMAGE_B64"},
+            ],
+        )
+
+    @patch("chatmock.routes_openai.start_upstream_raw_request")
+    def test_image_generations_uses_partial_image_fallback(self, mock_start) -> None:
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.created", "response": {"id": "resp_image"}},
+                    {"type": "response.image_generation_call.partial_image", "partial_image": "PARTIAL_IMAGE_B64"},
+                    {"type": "response.completed", "response": {"id": "resp_image", "output": []}},
+                ],
+                headers={"Content-Type": "text/event-stream"},
+            ),
+            None,
+        )
+
+        response = self.client.post(
+            "/v1/images/generations",
+            json={"prompt": "make an app icon"},
+        )
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["data"][0]["b64_json"], "PARTIAL_IMAGE_B64")
+        self.assertEqual(response.headers["x-chatmock-image-stage"], "partial")
+
+    @patch("chatmock.routes_openai.start_upstream_raw_request")
+    def test_responses_route_normalizes_image_generation_tool_options(self, mock_start) -> None:
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.created", "response": {"id": "resp_image_tool"}},
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_image_tool",
+                            "object": "response",
+                            "status": "completed",
+                            "output": [],
+                        },
+                    },
+                ],
+                headers={"Content-Type": "text/event-stream"},
+            ),
+            None,
+        )
+
+        response = self.client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.4",
+                "input": "hello",
+                "tools": [{"type": "image_generation", "quality": "med", "size": "4k", "partial_images": 9}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        outbound_payload = mock_start.call_args.args[0]
+        self.assertEqual(outbound_payload["tools"][0]["quality"], "medium")
+        self.assertEqual(outbound_payload["tools"][0]["size"], "3840x2160")
+        self.assertEqual(outbound_payload["tools"][0]["partial_images"], 3)
+
     @patch("chatmock.websocket_routes.get_effective_chatgpt_auth", return_value=("token", "acct"))
     @patch("chatmock.websocket_routes.connect_upstream_websocket")
     def test_responses_websocket_rewrites_response_create(self, mock_connect, _mock_auth) -> None:
